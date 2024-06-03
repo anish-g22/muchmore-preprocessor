@@ -239,6 +239,8 @@ def main_fn():
     progress_bar = tqdm(total=len(file_names), desc="Reading files", initial=saved_ckpt)
     for fname in file_names[saved_ckpt:]:
         if (fname in error_files):
+            count += 1
+            global_ckpt_data = count 
             continue
         try:
             global_ckpt_data = count
