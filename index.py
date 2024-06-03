@@ -1,13 +1,31 @@
 from tqdm import tqdm
 import xmltodict
 import json
+import brew_distance
+import signal
+import sys
 
 doc_names_path = "D:/OTH/MuchMore/{}_files.txt"
 file_path = "D:/OTH/MuchMore/springer_{}_train_V4.2.tar/{}.{}.abstr.chunkmorph.annotated.xml"
 save_path = "D:/OTH/MuchMore_pre_processed/{}/{}.txt"
 error_path = "D:/OTH/MuchMore_pre_processed/error.txt"
+utf_file_path = "D:/OTH/MuchMore/plain_springer_english_train_V4.2.tar/UTF/{}.ger.abstr.utf8"
+edit_dist_log_path = "D:/OTH/MuchMore_pre_processed/edit_log.txt"
+ckpt_path = "D:/OTH/MuchMore_pre_processed/ckpt.txt"
+
+global_ckpt_data = 0
+
+def signal_handler(sig, frame):
+    global global_ckpt_data
+    if global_ckpt_data:
+        data = {"curr": global_ckpt_data}
+        save_ckpt(data)
+        print("\nCheckpoint data saved.")
+    sys.exit(0)
+signal.signal(signal.SIGINT, signal_handler)
 
 Errors = []
+Edit_log = ""
 # Returns the python dictionary of a file
 def get_file_lines(file):
     try:
@@ -60,10 +78,57 @@ def get_file_pair(file_name):
     de_file_path = file_path.format("german", file_name, "ger")
     en_sentences, en_lines = get_sentences_all(en_file_path)
     de_sentences, de_lines = get_sentences_all(de_file_path)
-    return align_file_pairs([en_sentences, de_sentences], [en_lines, de_lines])
+    return align_file_pairs(file_name, [en_sentences, de_sentences], [en_lines, de_lines])
 
-def align_file_pairs(sentences, pairs):
+def align_de_sentences(file_name, text_reference, data):
+    xml_text = ''.join(data)
+    xml_sentences = data
+
+    cost, edits = brew_distance.distance(text_reference, xml_text, "both", cost=(0, 1, 0.8, 1))
+    rel_cost = cost / len(text_reference)
+    if (rel_cost > 0.2):
+        # print("these are really different: ", (cost, rel_cost, text_reference, xml_text))
+        Edit_log += f"{file_name}: Cost <{cost}> Rel Cost <{rel_cost}>\n"
+        return data
+    #rel_cost, edits
+    sentence_counter = 0
+    text_sentence_start = 0
+    sentences = []
+
+    xml_sentence_lengths = [len(sent) for sent in xml_sentences]
+    xml_sentence_ends = [0] * len(xml_sentence_lengths) + [-1]
+    for i in range(len(xml_sentence_lengths)):
+        xml_sentence_ends[i] = sum(xml_sentence_lengths[0:i+1]) - 1
+    #print(xml_sentence_lengths, xml_sentence_ends, len(xml_text), sum(xml_sentence_lengths))
+    text_counter, xml_counter = 0, 0
+    for edit in edits:
+        if edit in ("MATCH", "SUBST"):
+            text_counter += 1
+            xml_counter += 1
+        elif edit == "INS":
+            xml_counter += 1
+        elif edit == "DEL": 
+            text_counter += 1
+        else:
+            raise AssertionError("unknown edit type" + edit)
+        if xml_counter == xml_sentence_ends[sentence_counter]:
+            sentences += [text_reference[text_sentence_start:text_counter+1].lstrip()]
+            text_sentence_start = text_counter + 1
+            sentence_counter += 1
+    
+    return sentences
+    
+
+def align_file_pairs(file_name, sentences, pairs):
     en_sentences, de_sentences = sentences
+    reference = ""
+    try:
+        with open (utf_file_path.format(file_name), 'r', encoding='utf-8') as f:
+            reference = f.read()     
+        de_sentences = align_de_sentences(file_name, reference, de_sentences)
+    except Exception as e:
+        Errors.append(e)
+    
     en_lines, de_lines = pairs
     en_pairs = get_sentence_pairs(en_lines)
     de_pairs = get_sentence_pairs(de_lines)
@@ -126,7 +191,7 @@ def save_new_file(file_name, lang, data):
         with open(saved_path, 'a') as f:
             f.truncate(0)
             for line in data:
-                f.write(line + "\n")
+                f.write(line.strip() + "\n")
     except Exception as e:
         # print(f"[-] save new file {file_name} | Language : {lang} \n{e}\n\n")
         Errors.append(f"[-] save new file {file_name} | Language : {lang} \n{e}\n\n")
@@ -146,29 +211,54 @@ def get_error_files():
         # print(f"[-] error.txt\n\n{e}\n\n")
         Errors.append(f"[-] error.txt\n\n{e}\n\n")
 
+def save_edit_log(log):
+    with open(edit_dist_log_path,'a+') as f:
+        f.write(log)
+        
+def save_ckpt(data):
+    with open(ckpt_path, 'w') as f:
+        data = json.dumps(data)
+        f.write(data)
+
+def load_ckpt():
+    with open(ckpt_path,'r') as f:
+        data = f.read()
+        return json.loads(data)
+
+
 def main_fn():
+    global global_ckpt_data
     file_names = sorted(list(get_file_names()))
     print(f"Total Files available: {len(file_names)}")
     count = 0
-    # saved_ckpt = 13
+    saved_ckpt = load_ckpt()["curr"]
     error_files = get_error_files()
+    global_ckpt_data = saved_ckpt
+    print(f"Saved CheckPoint: {saved_ckpt}")
     erroneous_files = []
-    for fname in tqdm(file_names, desc="Reading files"):
+    progress_bar = tqdm(total=len(file_names), desc="Reading files", initial=saved_ckpt)
+    for fname in file_names[saved_ckpt:]:
         if (fname in error_files):
             continue
         try:
+            global_ckpt_data = count
             en_data, de_data = get_file_pair(fname)
+            count += 1
         except Exception as e:
             # print(f"[-] get file pair\n{e}\n\n")
             Errors.append(f"[-] get file pair\n{e}\n\n")
             erroneous_files.append(fname)
             continue
 
-        save_new_file(fname, "en", en_data)
-        save_new_file(fname, "de", de_data)
+        # save_new_file(fname, "en", en_data)
+        save_new_file(fname+" UTF version", "de", de_data)
+        progress_bar.update(1)
         count += 1
+        global_ckpt_data = count
         # print(f"[+] Count: {count}")
-
+    ckpt = {"curr": count}
+    save_ckpt(ckpt)
+    save_edit_log(Edit_log)
     print("\n\n--------\n\nRun completed")
     
 def check_punct():
@@ -193,7 +283,7 @@ def check_punct():
             # print(f"[-] get file pair\n{e}\n\n")
             Errors.append(f"[-] get file pair\n{e}\n\n")
             erroneous_files.append(fname)
-            continue        
+            continue   
         
     
     print(f"Number of files with more than one full stop: {count}\n\n")
@@ -201,8 +291,8 @@ def check_punct():
     print("\n\n--------\n\nRun completed")
 
 def run():
-    # main_fn()
-    check_punct()
+    main_fn()
+    # check_punct()
     # print(len(get_error_files()))
 
 run()
